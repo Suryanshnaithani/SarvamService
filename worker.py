@@ -4,10 +4,8 @@ import json
 import threading
 import requests
 import pandas as pd
-import smtplib
 import base64
 import io
-from email.mime.text import MIMEText
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from sarvamai import SarvamAI
 
@@ -16,17 +14,19 @@ from sarvamai import SarvamAI
 # =====================================================
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
+# SendGrid (SMTP WILL NOT WORK ON RENDER)
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
+# GitHub
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_FILE_PATH = os.getenv("GITHUB_FILE_PATH")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
-CHECK_INTERVAL = 300          # 5 minutes
+CHECK_INTERVAL = 300
 BATCH_EMAIL_SIZE = 500
 DOWNLOAD_DIR = "downloads"
 STATE_FILE = "processed_state.json"
@@ -92,8 +92,7 @@ def read_excel_from_github():
     r.raise_for_status()
     data = r.json()
     content = base64.b64decode(data["content"])
-    df = pd.read_excel(io.BytesIO(content), dtype=str)
-    df = df.fillna("")
+    df = pd.read_excel(io.BytesIO(content), dtype=str).fillna("")
     return df, data["sha"]
 
 def write_excel_to_github(df, sha, message):
@@ -120,14 +119,29 @@ def save_state():
 
 def send_email(subject, body):
     try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_USER
-        msg["To"] = EMAIL_TO
+        payload = {
+            "personalizations": [
+                {"to": [{"email": EMAIL_TO}]}
+            ],
+            "from": {"email": EMAIL_FROM},
+            "subject": subject,
+            "content": [
+                {"type": "text/plain", "value": body}
+            ]
+        }
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
+        headers = {
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        r = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+        r.raise_for_status()
 
         print(f"📧 Email sent: {subject}", flush=True)
     except Exception as e:
@@ -157,9 +171,6 @@ processed_total = len(processed_state)
 
 print("🚀 Worker started (Render Web Service)", flush=True)
 
-# OPTIONAL STARTUP MAIL (enable once if needed)
-# send_email("SarvamAI Worker Started", "Worker is live on Render.")
-
 while True:
     try:
         print("🔄 New cycle started", flush=True)
@@ -186,8 +197,10 @@ while True:
             }
             save_state()
 
+            # ✅ FIXED STATUS UPDATE
             df.at[idx, "job_id"] = job_id
             df.at[idx, "status"] = "submitted"
+            df.at[idx, "processed"] = "TRUE"
 
             write_excel_to_github(
                 df,
@@ -210,14 +223,14 @@ while True:
 
             time.sleep(2)
 
-        # 🔔 Cycle summary mail
+        # 🔔 Cycle email
         if newly_processed > 0:
             send_email(
                 "SarvamAI Cycle Update",
-                f"Processed {newly_processed} documents this cycle.\nTotal: {processed_total}"
+                f"Processed {newly_processed} document(s).\nTotal: {processed_total}"
             )
 
-        # 🔔 Final completion mail
+        # 🔔 Final completion email
         pending = any(
             row["document_name"] not in processed_state
             for _, row in df.iterrows()
@@ -229,7 +242,7 @@ while True:
                 f"All documents processed.\nTotal: {processed_total}"
             )
 
-        print("😴 Sleeping...", flush=True)
+        print(f"😴 Sleeping for {CHECK_INTERVAL} seconds...", flush=True)
         time.sleep(CHECK_INTERVAL)
 
     except Exception as e:
